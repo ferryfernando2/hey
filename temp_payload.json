@@ -1,0 +1,9 @@
+﻿{
+    "id":  "test_sched_1762022702.24132_d3827c",
+    "fromId":  "user_test_a",
+    "scheduledAt":  "2025-11-01T11:44:32.2020211Z",
+    "content":  "Automated scheduled test",
+    "toId":  "user_test_b",
+    "chatId":  "user_test_a_user_test_b",
+    "stampEnabled":  true
+}
