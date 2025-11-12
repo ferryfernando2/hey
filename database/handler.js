@@ -347,8 +347,8 @@ class DatabaseHandler {
                 this.sqliteDb.run(`CREATE TABLE IF NOT EXISTS user_likes (
                     userId TEXT,
                     videoId TEXT,
-                    PRIMARY KEY (userId, videoId),
-                    createdAt TEXT
+                    createdAt TEXT,
+                    PRIMARY KEY (userId, videoId)
                 );`);
 
                 // If an older DB existed, ensure columns were added (pragma table_info)
@@ -539,8 +539,8 @@ class DatabaseHandler {
                 CREATE TABLE IF NOT EXISTS user_likes (
                     userid TEXT,
                     videoid TEXT,
-                    PRIMARY KEY (userid, videoid),
-                    createdat TEXT
+                    createdat TEXT,
+                    PRIMARY KEY (userid, videoid)
                 );
             `);
         } finally {
