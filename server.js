@@ -99,7 +99,19 @@ const consumeToken = (key, cost = 1) => {
 
 // Basic middleware
 // Performance optimizations
-app.use(require('compression')()); // Add compression
+// Configure compression but skip compressing video media (which breaks Range requests)
+try {
+    const compression = require('compression');
+    app.use(compression({
+        filter: (req, res) => {
+            try {
+                const url = req.url || '';
+                if (url.match(/\.(mp4|webm|ogg|mov|m4v)$/i)) return false;
+            } catch (e) {}
+            return compression.filter(req, res);
+        }
+    }));
+} catch (e) {}
 
 // Enable caching headers globally
 app.use((req, res, next) => {
@@ -160,8 +172,59 @@ app.use((req, res, next) => {
 // Serve uploaded status files
 const path = require('path');
 const fs = require('fs');
+// mime type helper (optional)
+let mime = null;
+try { mime = require('mime-types'); } catch (e) { mime = null; }
 const UPLOAD_DIR = path.join(__dirname, 'uploads', 'statuses');
 try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch (e) {}
+// Explicit range-aware handler for video files to ensure browsers can request byte ranges.
+// This takes precedence over express.static and guarantees correct headers for streaming.
+app.get('/uploads/statuses/:filename', (req, res) => {
+    try {
+        const filename = req.params.filename || '';
+        // Prevent path traversal
+        if (filename.includes('..') || filename.includes('/')) return res.status(400).end('Invalid filename');
+        const filePath = path.join(UPLOAD_DIR, filename);
+        // ensure the file is inside the upload dir
+        if (!filePath.startsWith(UPLOAD_DIR)) return res.status(403).end('Forbidden');
+        if (!fs.existsSync(filePath)) return res.status(404).end('Not found');
+
+        const stat = fs.statSync(filePath);
+        const total = stat.size;
+
+        const range = req.headers.range;
+        const contentType = (mime && mime.lookup ? mime.lookup(filePath) : null) || 'application/octet-stream';
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Accept-Ranges', 'bytes');
+
+        if (!range) {
+            // No range header - send entire file
+            res.setHeader('Content-Length', total);
+            res.status(200);
+            const stream = fs.createReadStream(filePath);
+            return stream.pipe(res);
+        }
+
+        // Parse Range header: bytes=start-end
+        const parts = range.replace(/bytes=/, '').split('-');
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : (total - 1);
+        if (isNaN(start) || isNaN(end) || start > end || start < 0) return res.status(416).setHeader('Content-Range', `bytes */${total}`).end();
+
+        const chunkSize = (end - start) + 1;
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+        res.setHeader('Content-Length', chunkSize);
+
+        const stream = fs.createReadStream(filePath, { start, end });
+        return stream.pipe(res);
+    } catch (e) {
+        console.error('video stream error', e);
+        return res.status(500).end('Server error');
+    }
+});
+
+// Fallback static serving for other assets in uploads/statuses (if any)
 app.use('/uploads/statuses', express.static(UPLOAD_DIR));
  
  // Serve uploaded avatars
@@ -1837,15 +1900,20 @@ app.post('/admin/clearMessages', requireAdminToken, async (req, res) => {
 
                 switch (data.type) {
                     case 'auth':
-                        if (!data.userId) throw new Error('User ID is required for authentication');
+                        // Allow auth with or without userId (guests allowed)
+                        if (!data.userId) {
+                            console.log(`WS auth: guest connection (socket=${ws._instanceId})`);
+                            ws._sharePresence = (data.sharePresence === undefined) ? true : !!data.sharePresence;
+                            break;
+                        }
                         // normalize and store as string keys to avoid numeric/string mismatch
-                            const normalizedUserId = data.userId ? String(data.userId) : data.userId;
-                            // Log mapping event
-                            // include remote address when available to correlate client
-                            const remoteAddr = (req && req.socket && (req.socket.remoteAddress || req.socket.remotePort)) ? `${req.socket.remoteAddress || 'unknown'}:${req.socket.remotePort || 'unknown'}` : 'unknown';
-                            console.log(`WS auth: adding mapping user=${normalizedUserId} -> socket=${ws._instanceId} (remote=${remoteAddr})`);
-                            addClient(normalizedUserId, ws);
-                            ws.userId = normalizedUserId;
+                        const normalizedUserId = data.userId ? String(data.userId) : data.userId;
+                        // Log mapping event
+                        // include remote address when available to correlate client
+                        const remoteAddr = (req && req.socket && (req.socket.remoteAddress || req.socket.remotePort)) ? `${req.socket.remoteAddress || 'unknown'}:${req.socket.remotePort || 'unknown'}` : 'unknown';
+                        console.log(`WS auth: adding mapping user=${normalizedUserId} -> socket=${ws._instanceId} (remote=${remoteAddr})`);
+                        addClient(normalizedUserId, ws);
+                        ws.userId = normalizedUserId;
                         // honor client preference whether to share presence publicly
                         ws._sharePresence = (data.sharePresence === undefined) ? true : !!data.sharePresence;
                         await db.updateUserStatus(data.userId, true);
@@ -1867,11 +1935,11 @@ app.post('/admin/clearMessages', requireAdminToken, async (req, res) => {
 
                         // deliver any pending (undelivered) messages that we kept in memory
                         try {
-                                const queue = pendingMessages.get(String(data.userId)) || [];
-                                if (queue.length) {
-                                    console.log(`Delivering ${queue.length} pending message(s) to user=${String(data.userId)} on socket=${ws._instanceId}`);
-                                    // deliver each and then remove from pending storage
-                                    for (const m of queue) {
+                            const queue = pendingMessages.get(String(data.userId)) || [];
+                            if (queue.length) {
+                                console.log(`Delivering ${queue.length} pending message(s) to user=${String(data.userId)} on socket=${ws._instanceId}`);
+                                // deliver each and then remove from pending storage
+                                for (const m of queue) {
                                     try {
                                         if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'chat', data: m }));
                                         // notify original sender (if connected) that we've delivered to recipient (all their sockets)
