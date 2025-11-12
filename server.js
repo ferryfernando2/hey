@@ -179,50 +179,95 @@ const UPLOAD_DIR = path.join(__dirname, 'uploads', 'statuses');
 try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch (e) {}
 // Explicit range-aware handler for video files to ensure browsers can request byte ranges.
 // This takes precedence over express.static and guarantees correct headers for streaming.
-app.get('/uploads/statuses/:filename', (req, res) => {
-    try {
-        const filename = req.params.filename || '';
-        // Prevent path traversal
-        if (filename.includes('..') || filename.includes('/')) return res.status(400).end('Invalid filename');
-        const filePath = path.join(UPLOAD_DIR, filename);
-        // ensure the file is inside the upload dir
-        if (!filePath.startsWith(UPLOAD_DIR)) return res.status(403).end('Forbidden');
-        if (!fs.existsSync(filePath)) return res.status(404).end('Not found');
+// Range-aware handler: support HEAD and GET explicitly so probes from the
+// Flutter client (which does HEAD then ranged GET) behave reliably.
+app.route('/uploads/statuses/:filename')
+    .head((req, res) => {
+        try {
+            const filename = req.params.filename || '';
+            if (filename.includes('..') || filename.includes('/')) return res.status(400).end('Invalid filename');
+            const filePath = path.join(UPLOAD_DIR, filename);
+            if (!filePath.startsWith(UPLOAD_DIR)) return res.status(403).end('Forbidden');
+            if (!fs.existsSync(filePath)) return res.status(404).end('Not found');
 
-        const stat = fs.statSync(filePath);
-        const total = stat.size;
+            const stat = fs.statSync(filePath);
+            const total = stat.size;
+            const range = req.headers.range;
+            const contentType = (mime && mime.lookup ? mime.lookup(filePath) : null) || 'application/octet-stream';
+            res.setHeader('Content-Type', contentType);
+            res.setHeader('Accept-Ranges', 'bytes');
 
-        const range = req.headers.range;
-        const contentType = (mime && mime.lookup ? mime.lookup(filePath) : null) || 'application/octet-stream';
-        res.setHeader('Content-Type', contentType);
-        res.setHeader('Accept-Ranges', 'bytes');
+            if (!range) {
+                res.setHeader('Content-Length', total);
+                res.status(200).end();
+                console.debug('[HEAD /uploads/statuses] file=', filename, 'status=200');
+                return;
+            }
 
-        if (!range) {
-            // No range header - send entire file
-            res.setHeader('Content-Length', total);
-            res.status(200);
-            const stream = fs.createReadStream(filePath);
-            return stream.pipe(res);
+            // parse requested range
+            const parts = range.replace(/bytes=/, '').split('-');
+            const start = parseInt(parts[0], 10);
+            const end = parts[1] ? parseInt(parts[1], 10) : (total - 1);
+            if (isNaN(start) || isNaN(end) || start > end || start < 0) {
+                res.status(416).setHeader('Content-Range', `bytes */${total}`).end();
+                console.debug('[HEAD /uploads/statuses] file=', filename, 'status=416 range=', range);
+                return;
+            }
+
+            res.status(206);
+            res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+            res.setHeader('Content-Length', (end - start) + 1);
+            res.end();
+            console.debug('[HEAD /uploads/statuses] file=', filename, 'status=206 range=', `${start}-${end}`);
+        } catch (e) {
+            console.error('video HEAD error', e);
+            return res.status(500).end('Server error');
         }
+    })
+    .get((req, res) => {
+        try {
+            const filename = req.params.filename || '';
+            if (filename.includes('..') || filename.includes('/')) return res.status(400).end('Invalid filename');
+            const filePath = path.join(UPLOAD_DIR, filename);
+            if (!filePath.startsWith(UPLOAD_DIR)) return res.status(403).end('Forbidden');
+            if (!fs.existsSync(filePath)) return res.status(404).end('Not found');
 
-        // Parse Range header: bytes=start-end
-        const parts = range.replace(/bytes=/, '').split('-');
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : (total - 1);
-        if (isNaN(start) || isNaN(end) || start > end || start < 0) return res.status(416).setHeader('Content-Range', `bytes */${total}`).end();
+            const stat = fs.statSync(filePath);
+            const total = stat.size;
+            const range = req.headers.range;
+            const contentType = (mime && mime.lookup ? mime.lookup(filePath) : null) || 'application/octet-stream';
+            res.setHeader('Content-Type', contentType);
+            res.setHeader('Accept-Ranges', 'bytes');
 
-        const chunkSize = (end - start) + 1;
-        res.status(206);
-        res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
-        res.setHeader('Content-Length', chunkSize);
+            console.debug('[GET /uploads/statuses] filename=', filename, 'range=', range || '(none)');
 
-        const stream = fs.createReadStream(filePath, { start, end });
-        return stream.pipe(res);
-    } catch (e) {
-        console.error('video stream error', e);
-        return res.status(500).end('Server error');
-    }
-});
+            if (!range) {
+                res.setHeader('Content-Length', total);
+                res.status(200);
+                const stream = fs.createReadStream(filePath);
+                return stream.pipe(res);
+            }
+
+            const parts = range.replace(/bytes=/, '').split('-');
+            const start = parseInt(parts[0], 10);
+            const end = parts[1] ? parseInt(parts[1], 10) : (total - 1);
+            if (isNaN(start) || isNaN(end) || start > end || start < 0) {
+                res.status(416).setHeader('Content-Range', `bytes */${total}`).end();
+                console.debug('[GET /uploads/statuses] filename=', filename, 'invalid range=', range);
+                return;
+            }
+
+            const chunkSize = (end - start) + 1;
+            res.status(206);
+            res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+            res.setHeader('Content-Length', chunkSize);
+            const stream = fs.createReadStream(filePath, { start, end });
+            return stream.pipe(res);
+        } catch (e) {
+            console.error('video stream error', e);
+            return res.status(500).end('Server error');
+        }
+    });
 
 // Fallback static serving for other assets in uploads/statuses (if any)
 app.use('/uploads/statuses', express.static(UPLOAD_DIR));
